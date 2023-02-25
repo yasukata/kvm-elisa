@@ -1,0 +1,141 @@
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -5639,6 +5639,128 @@ static int handle_bus_lock_vmexit(struct kvm_vcpu *vcpu)
+ 	return 1;
+ }
+ 
++#define KVM_HC_ELISA_UTIL (1000)
++
++enum {
++	HC_ELISA_UTIL_DEBUG = 1,
++	HC_ELISA_UTIL_VMCS,
++	HC_ELISA_UTIL_ADDR,
++};
++
++enum {
++	HC_ELISA_UTIL_VMCS_READ64 = 1,
++	HC_ELISA_UTIL_VMCS_WRITE64,
++};
++
++enum {
++	HC_ELISA_UTIL_ADDR_GPA_TO_HPA = 1,
++};
++
++static unsigned long vmx_handle_hc_elisa_util(struct kvm_vcpu *vcpu)
++{
++	u64 ret = (u64) -KVM_ENOSYS;
++	switch ((u64) kvm_rbx_read(vcpu)) {
++	case HC_ELISA_UTIL_VMCS:
++		switch ((u64) kvm_rcx_read(vcpu)) {
++		case HC_ELISA_UTIL_VMCS_READ64:
++			ret = vmcs_read64((u64) kvm_rdx_read(vcpu));
++			break;
++		case HC_ELISA_UTIL_VMCS_WRITE64:
++			vmcs_write64((u64) kvm_rdx_read(vcpu), (u64) kvm_rsi_read(vcpu));
++			ret = 0;
++			break;
++		}
++		break;
++	case HC_ELISA_UTIL_ADDR:
++		switch ((u64) kvm_rcx_read(vcpu)) {
++		case HC_ELISA_UTIL_ADDR_GPA_TO_HPA:
++			ret = gfn_to_pfn(vcpu->kvm, (u64) kvm_rdx_read(vcpu) >> 12) << 12;
++			break;
++		}
++		break;
++	}
++	kvm_rax_write(vcpu, ret);
++	++vcpu->stat.hypercalls;
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
++#define KVM_HC_ELISA_NEGOTIATION (1001)
++
++enum {
++	HC_ELISA_NEGOTIATION_DEBUG = 1,
++	HC_ELISA_NEGOTIATION_MANAGER,
++	HC_ELISA_NEGOTIATION_GUEST,
++};
++
++enum {
++	HC_ELISA_NEGOTIATION_MANAGER_RENDEZVOUS_POINT_VCPU_ID = 1,
++	HC_ELISA_NEGOTIATION_MANAGER_RENDEZVOUS_POINT_EPTP_LIST_HPA,
++};
++
++enum {
++	HC_ELISA_NEGOTIATION_GUEST_VCPU_ID = 1,
++	HC_ELISA_NEGOTIATION_GUEST_ACTIVATE,
++};
++
++struct elisa_rendezvous_point {
++	uint64_t guest_vcpu_id;
++	uint64_t eptp_list_hpa;
++} __attribute__((packed));
++
++static struct elisa_rendezvous_point elisa_rendezvous_point = { 0 }; /* XXX: no lock, just because of lazy implementation */
++
++static unsigned long vmx_handle_hc_elisa_negotiation(struct kvm_vcpu *vcpu)
++{
++	u64 ret = (u64) -KVM_ENOSYS;
++	switch ((u64) kvm_rbx_read(vcpu)) {
++	case HC_ELISA_NEGOTIATION_MANAGER:
++		switch ((u64) kvm_rcx_read(vcpu)) {
++		case HC_ELISA_NEGOTIATION_MANAGER_RENDEZVOUS_POINT_VCPU_ID:
++			elisa_rendezvous_point.guest_vcpu_id = (u64) kvm_rdx_read(vcpu);
++			break;
++		case HC_ELISA_NEGOTIATION_MANAGER_RENDEZVOUS_POINT_EPTP_LIST_HPA:
++			elisa_rendezvous_point.eptp_list_hpa = (u64) kvm_rdx_read(vcpu);
++			break;
++		}
++		break;
++	case HC_ELISA_NEGOTIATION_GUEST:
++		switch ((u64) kvm_rcx_read(vcpu)) {
++		case HC_ELISA_NEGOTIATION_GUEST_VCPU_ID:
++			ret = (u64) vcpu;
++			break;
++		case HC_ELISA_NEGOTIATION_GUEST_ACTIVATE:
++			if (elisa_rendezvous_point.guest_vcpu_id == (uint64_t) vcpu) {
++				u64 *eptp_list_hva = (u64 *) phys_to_virt(elisa_rendezvous_point.eptp_list_hpa & (((1UL << 52) - 1) & ~((1UL << 12) - 1)));
++				eptp_list_hva[0] = vmcs_read64(EPT_POINTER);
++				vmcs_write64(VM_FUNCTION_CONTROL, VMX_VMFUNC_EPTP_SWITCHING);
++				vmcs_write64(EPTP_LIST_ADDRESS, elisa_rendezvous_point.eptp_list_hpa);
++			}
++			break;
++		}
++		break;
++	}
++	kvm_rax_write(vcpu, ret);
++	++vcpu->stat.hypercalls;
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
++static int handle_vmx_hypercall(struct kvm_vcpu *vcpu)
++{
++	int ret;
++	switch (kvm_rax_read(vcpu)) {
++	case KVM_HC_ELISA_UTIL:
++		ret = vmx_handle_hc_elisa_util(vcpu);
++		break;
++	case KVM_HC_ELISA_NEGOTIATION:
++		ret = vmx_handle_hc_elisa_negotiation(vcpu);
++		break;
++	default:
++		ret = kvm_emulate_hypercall(vcpu);
++		break;
++	}
++	return ret;
++}
++
+ /*
+  * The exit handlers return 1 if the exit was handled fully and guest execution
+  * may resume.  Otherwise they set the kvm_run parameter to indicate what needs
+@@ -5660,7 +5782,7 @@ static int (*kvm_vmx_exit_handlers[])(struct kvm_vcpu *vcpu) = {
+ 	[EXIT_REASON_INVD]		      = kvm_emulate_invd,
+ 	[EXIT_REASON_INVLPG]		      = handle_invlpg,
+ 	[EXIT_REASON_RDPMC]                   = kvm_emulate_rdpmc,
+-	[EXIT_REASON_VMCALL]                  = kvm_emulate_hypercall,
++	[EXIT_REASON_VMCALL]                  = handle_vmx_hypercall,
+ 	[EXIT_REASON_VMCLEAR]		      = handle_vmx_instruction,
+ 	[EXIT_REASON_VMLAUNCH]		      = handle_vmx_instruction,
+ 	[EXIT_REASON_VMPTRLD]		      = handle_vmx_instruction,
